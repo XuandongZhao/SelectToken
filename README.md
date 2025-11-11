@@ -15,7 +15,7 @@ Welcome to the open-source code for the NeurIPS 2025 paper, "[Beyond the 80/20 R
 
 Our code is based on [verl](https://github.com/volcengine/verl) (commit id `6cf90ceb079bdc0721b51c23e0107410651ccd82`). 
 
-We recommend using [this Docker image](https://hub.docker.com/layers/hiyouga/verl/ngc-th2.7.1-cu12.6-vllm0.10.0/images/sha256-cfc8c1ce3ea52dee0444f3e58e900d0b1d3b6b315deaf5f58c44b5fbb52fa989), using the following command:
+We recommend using [this Docker image](https://hub.docker.com/layers/hiyouga/verl/ngc-th2.7.1-cu12.6-vllm0.10.0/images/sha256-cfc8c1ce3ea52dee0444f3e58e900d0b1d3b6b315deaf5f58c44b5fbb52fa989), with the following command:
 
 ```bash
 docker pull hiyouga/verl:ngc-th2.7.1-cu12.6-vllm0.10.0
