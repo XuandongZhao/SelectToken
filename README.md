@@ -11,6 +11,8 @@
 
 Welcome to the open-source code for the NeurIPS 2025 paper, "[Beyond the 80/20 Rule: High-Entropy Minority Tokens Drive Effective Reinforcement Learning for LLM Reasoning](https://arxiv.org/abs/2506.01939)." Thank you for your interest!
 
+<img src="img/teaser.png" alt="teaser" style="zoom:60%;" />
+
 ## Installation
 
 Our code is based on [verl](https://github.com/volcengine/verl) (commit id `6cf90ceb079bdc0721b51c23e0107410651ccd82`). 
