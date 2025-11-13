@@ -49,6 +49,8 @@ For the DAPO baseline on [Qwen3-14B-Base](https://huggingface.co/Qwen/Qwen3-14B-
 
 For our proposed method, i.e. DAPO with the top 20% high-entropy tokens, on [Qwen3-14B-Base](https://huggingface.co/Qwen/Qwen3-14B-Base), please refer to the script [recipe/rlvr_with_high_entropy_tokens_only/run_only_top20_high_entropy_tokens_dapo_qwen3_14b.sh](recipe/rlvr_with_high_entropy_tokens_only/run_only_top20_high_entropy_tokens_dapo_qwen3_14b.sh).
 
+The training record of Qwen3-14B-Base is published in [W&B](https://api.wandb.ai/links/zhouxiangxin-university-of-chinese-academy-of-sciences/0ikhi10b).
+
 ## Citation
 
 If you find our work useful, we would appreciate it if you could cite it:
