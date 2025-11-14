@@ -65,7 +65,7 @@ If you find our work useful, we would appreciate it if you could cite it:
 }
 ```
 
-## Acknowledge
+## Acknowledgement
 
 We greatly appreciate [Xiangxin Zhou](https://zhouxiangxin1998.github.io/)'s efforts in reproducing our paper on the public verl codebase.
 
