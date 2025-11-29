@@ -26,6 +26,17 @@ docker pull hiyouga/verl:ngc-th2.7.1-cu12.6-vllm0.10.0
 
 Alternatively, you can refer to [the verl documentation](https://verl.readthedocs.io/en/latest/start/install.html) for instructions on installing the environment. We recommend aligning the installed environment with the Docker image mentioned above.
 
+
+> [!IMPORTANT]
+>
+> **CRITICAL UPDATE: Please ensure you are using the latest version of the code.**
+> 
+> A bug was introduced during the process of converting the repository to open source, which has now been fixed in [this commit](https://github.com/Shenzhi-Wang/Beyond-the-80-20-Rule-RLVR/commit/137d8d1e253c355d4cf86b8bb2dded5aa0d93580).
+> 
+> **You must use code from commit `137d8d1e253c355d4cf86b8bb2dded5aa0d93580` or later for correct results.**
+> 
+> *(Note: The code used to generate the results presented in our paper and on WandB was unaffected.)*
+
 ## Dataset Preparation
 
 For the training dataset, we recommend using the [math dataset](https://huggingface.co/datasets/LLM360/guru-RL-92k/resolve/main/train/math__combined_54.4k.parquet) from the [Reasoning360 paper](https://arxiv.org/abs/2506.14965), as it is more comprehensive than the [DAPO-Math-17k](https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17k) dataset used in our paper.
