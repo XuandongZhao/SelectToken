@@ -38,6 +38,9 @@ clip_ratio_low: 0.2
 # Upper bound for asymmetric clipping (used in dual-clip PPO)
 clip_ratio_high: 0.2
 
+# Added for "Beyond the 80/20 Rule" paper
+entropy_top_ratio: null # fraction of response tokens to keep (e.g. 0.2 = top 20%)
+
 # Whether to freeze vision model, if set true, it will be freeze vision model
 freeze_vision_tower: false
 

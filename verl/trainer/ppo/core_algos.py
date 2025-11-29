@@ -65,7 +65,7 @@ def get_global_entropy_top_mask(entropy, response_mask, top_ratio=0.2):
     
     # Flatten
     flat_entropy = entropy.flatten()
-    flat_mask = response_mask.flatten()
+    flat_mask = response_mask.flatten().bool()
     
     # Filter response token
     response_entropy = flat_entropy[flat_mask]

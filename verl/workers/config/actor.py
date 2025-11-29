@@ -121,6 +121,9 @@ class ActorConfig(BaseConfig):
     rollout_n: int = 1  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
 
+    # Added for "Beyond the 80/20 Rule" paper
+    entropy_top_ratio: Optional[float] = None # fraction of response tokens to keep (e.g. 0.2 = top 20%)
+
     def __post_init__(self):
         """Validate actor configuration parameters."""
         assert self.strategy != MISSING

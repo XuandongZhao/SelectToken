@@ -230,6 +230,9 @@ actor_rollout_ref:
     # Upper bound for asymmetric clipping (used in dual-clip PPO)
     clip_ratio_high: 0.2
 
+    # Added for "Beyond the 80/20 Rule" paper
+    entropy_top_ratio: null # fraction of response tokens to keep (e.g. 0.2 = top 20%)
+
     # policy loss config
     policy_loss:
 

@@ -61,7 +61,9 @@ actor_rollout_ref:
     clip_ratio: 0.2 # default value if clip_ratio_low and clip_ratio_high are not specified
     clip_ratio_low: 0.2
     clip_ratio_high: 0.2
-    clip_ratio_c: 3.0 # lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729
+    clip_ratio_c: 3.0 # lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729 
+    # Added for "Beyond the 80/20 Rule" paper
+    entropy_top_ratio: null # fraction of response tokens to keep (e.g. 0.2 = top 20%)
     loss_agg_mode: "token-mean" # / "seq-mean-token-sum" / "seq-mean-token-mean"
     # NOTE: "token-mean" is the default behavior
     entropy_coeff: 0
