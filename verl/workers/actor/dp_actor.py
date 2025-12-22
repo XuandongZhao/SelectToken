@@ -30,6 +30,7 @@ from verl import DataProto
 from verl.trainer.ppo.core_algos import (
     agg_loss,
     get_global_entropy_top_mask,
+    get_probability_based_mask,
     get_policy_loss_fn,
     kl_penalty,
 )
@@ -95,15 +96,37 @@ class DataParallelPPOActor(BasePPOActor):
             if self.config.get("use_torch_compile", True)  # use torch compile by default
             else entropy_from_logits
         )
+        
+        # Set up probability metrics computation functions (following entropy pattern)
+        prob_metrics_with_chunking = self.config.get("prob_metrics_from_logits_with_chunking", False)
+        if prob_metrics_with_chunking:
+            max_probs_from_logits = verl_F.max_probs_from_logits_with_chunking
+            sum_of_squares_from_logits = verl_F.sum_of_squares_from_logits_with_chunking
+        else:
+            max_probs_from_logits = verl_F.max_probs_from_logits
+            sum_of_squares_from_logits = verl_F.sum_of_squares_from_logits
+        
+        self.compute_max_probs_from_logits = (
+            torch.compile(max_probs_from_logits, dynamic=True)
+            if self.config.get("use_torch_compile", True)
+            else max_probs_from_logits
+        )
+        self.compute_sum_of_squares_from_logits = (
+            torch.compile(sum_of_squares_from_logits, dynamic=True)
+            if self.config.get("use_torch_compile", True)
+            else sum_of_squares_from_logits
+        )
+        
         self.device_name = get_device_name()
 
     def _forward_micro_batch(
-        self, micro_batch, temperature, calculate_entropy=False
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self, micro_batch, temperature, calculate_entropy=False, compute_prob_metrics=False
+    ) -> tuple[torch.Tensor, torch.Tensor, dict | None]:
         """
         Returns:
             entropy: # (bs, response_len)
             log_probs: # (bs, response_len)
+            prob_metrics: # dict with 'max_probs' and 'sum_of_squares' or None
         """
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
@@ -200,6 +223,13 @@ class DataParallelPPOActor(BasePPOActor):
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                     logits_rmpad.div_(temperature)
 
+                    # Compute probability metrics if requested
+                    max_probs_rmpad = None
+                    sum_of_squares_rmpad = None
+                    if compute_prob_metrics:
+                        max_probs_rmpad = self.compute_max_probs_from_logits(logits_rmpad)
+                        sum_of_squares_rmpad = self.compute_sum_of_squares_from_logits(logits_rmpad)
+
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
                     if calculate_entropy:
@@ -249,6 +279,26 @@ class DataParallelPPOActor(BasePPOActor):
                     batch=batch_size,
                     seqlen=seqlen,
                 )
+                
+                # Pad prob_metrics if computed
+                prob_metrics = None
+                if compute_prob_metrics:
+                    full_max_probs = pad_input(
+                        hidden_states=max_probs_rmpad.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                    full_sum_of_squares = pad_input(
+                        hidden_states=sum_of_squares_rmpad.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                    prob_metrics = {
+                        'max_probs': full_max_probs.squeeze(-1)[:, -response_length - 1 : -1],
+                        'sum_of_squares': full_sum_of_squares.squeeze(-1)[:, -response_length - 1 : -1],
+                    }
 
                 # only return response part:
                 if calculate_entropy:
@@ -279,6 +329,17 @@ class DataParallelPPOActor(BasePPOActor):
 
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                    
+                    # Compute probability metrics if requested
+                    prob_metrics = None
+                    if compute_prob_metrics:
+                        max_probs = self.compute_max_probs_from_logits(logits)
+                        sum_of_squares = self.compute_sum_of_squares_from_logits(logits)
+                        prob_metrics = {
+                            'max_probs': max_probs,
+                            'sum_of_squares': sum_of_squares,
+                        }
+                    
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
@@ -286,7 +347,7 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
-            return entropy, log_probs
+            return entropy, log_probs, prob_metrics
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -352,7 +413,7 @@ class DataParallelPPOActor(BasePPOActor):
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
+                entropy, log_probs, _ = self._forward_micro_batch(
                     model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                 )
             log_probs_lst.append(log_probs)
@@ -441,10 +502,18 @@ class DataParallelPPOActor(BasePPOActor):
                     if entropy_top_ratio is not None and not (0 <= entropy_top_ratio <= 1):
                         raise ValueError(f"Invalid {entropy_top_ratio=}")
                     
+                    # Check mask mode
+                    mask_mode = self.config.get('mask_mode', 'entropy')  # 'entropy' or 'probability'
+                    max_prob_threshold = self.config.get('max_prob_threshold', 0.5)
+                    
                     if entropy_coeff != 0 or entropy_top_ratio is not None:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
-                        model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                    
+                    compute_prob_metrics = (mask_mode == 'probability')
+                    
+                    entropy, log_prob, prob_metrics = self._forward_micro_batch(
+                        model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
+                        compute_prob_metrics=compute_prob_metrics
                     )
 
                     # for fully_async_policy recipe
@@ -457,8 +526,16 @@ class DataParallelPPOActor(BasePPOActor):
                             old_log_prob = model_inputs["old_log_probs"]
                     
                     entropy_top_mask = None
-                    if entropy_top_ratio is not None:
+                    if mask_mode == 'entropy' and entropy_top_ratio is not None:
                         entropy_top_mask = get_global_entropy_top_mask(entropy=entropy, response_mask=response_mask, top_ratio=entropy_top_ratio)
+                    elif mask_mode == 'probability' and prob_metrics is not None:
+                        entropy_top_mask = get_probability_based_mask(
+                            log_prob=log_prob,
+                            max_probs=prob_metrics['max_probs'],
+                            sum_of_squares=prob_metrics['sum_of_squares'],
+                            response_mask=response_mask,
+                            max_prob_threshold=max_prob_threshold,
+                        )
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla

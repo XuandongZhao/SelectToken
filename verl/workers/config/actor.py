@@ -123,6 +123,11 @@ class ActorConfig(BaseConfig):
 
     # Added for "Beyond the 80/20 Rule" paper
     entropy_top_ratio: Optional[float] = None # fraction of response tokens to keep (e.g. 0.2 = top 20%)
+    
+    # Token selection mask configuration
+    mask_mode: str = 'entropy'  # 'entropy' or 'probability'
+    max_prob_threshold: float = 0.5  # threshold for max probability in probability mode
+    prob_metrics_from_logits_with_chunking: bool = False  # use chunking for memory efficiency
 
     def __post_init__(self):
         """Validate actor configuration parameters."""

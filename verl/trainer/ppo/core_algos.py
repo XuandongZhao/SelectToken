@@ -84,7 +84,40 @@ def get_global_entropy_top_mask(entropy, response_mask, top_ratio=0.2):
     flat_out = torch.zeros_like(flat_entropy, dtype=torch.long)
     flat_out[top_positions] = 1
     
-    return flat_out.view_as(entropy)  
+    return flat_out.view_as(entropy)
+
+
+def get_probability_based_mask(
+    log_prob,
+    max_probs,
+    sum_of_squares,
+    response_mask,
+    max_prob_threshold=0.5,
+):
+    """
+    Select tokens based on probability distribution criteria:
+    - max probability < max_prob_threshold AND
+    - selected token probability > sum of squares of distribution
+    
+    Args:
+        log_prob: [B, S] tensor of log probabilities of selected tokens.
+        max_probs: [B, S] tensor of maximum probabilities at each position.
+        sum_of_squares: [B, S] tensor of sum of squared probabilities.
+        response_mask: [B, S] tensor (1 = response token, 0 = non-response).
+        max_prob_threshold: float, threshold for maximum probability (default 0.5).
+        
+    Returns:
+        prob_mask: [B, S] binary mask (1 = selected token)
+    """
+    # Compute selected token probability from log_prob
+    selected_token_probs = torch.exp(log_prob)
+    
+    # Apply both criteria
+    mask = (max_probs < max_prob_threshold) & \
+           (selected_token_probs > sum_of_squares) & \
+           response_mask.bool()
+    
+    return mask.long()  
 
 
 def register_policy_loss(name: str) -> Callable[[PolicyLossFn], PolicyLossFn]:

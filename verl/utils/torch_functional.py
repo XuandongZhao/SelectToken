@@ -160,6 +160,75 @@ def entropy_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 20
     return entropy
 
 
+def max_probs_from_logits(logits: torch.Tensor):
+    """Calculate maximum probability from logits.
+    
+    Args:
+        logits: Tensor of shape (..., vocab_size)
+        
+    Returns:
+        Tensor of shape (...) containing max probability at each position
+    """
+    probs = torch.nn.functional.softmax(logits, dim=-1)
+    max_probs = probs.max(dim=-1).values
+    return max_probs
+
+
+def max_probs_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 2048):
+    """Memory-efficient maximum probability calculation with chunking.
+    
+    Args:
+        logits: Tensor of shape (batch, vocab_size)
+        chunk_size: Number of samples to process at once
+        
+    Returns:
+        Tensor of shape (batch,) containing max probability at each position
+    """
+    max_probs = torch.zeros(logits.shape[0], device=logits.device)
+    for i in range(0, logits.shape[0], chunk_size):
+        logits_chunk = logits[i : i + chunk_size].float()
+        probs_chunk = torch.nn.functional.softmax(logits_chunk, dim=-1)
+        max_probs_chunk = probs_chunk.max(dim=-1).values
+        max_probs[i : i + chunk_size] = max_probs_chunk
+    return max_probs
+
+
+def sum_of_squares_from_logits(logits: torch.Tensor):
+    """Calculate sum of squared probabilities from logits.
+    
+    This metric is related to the Gini-Simpson index and measures 
+    concentration of the probability distribution.
+    
+    Args:
+        logits: Tensor of shape (..., vocab_size)
+        
+    Returns:
+        Tensor of shape (...) containing sum of squared probabilities
+    """
+    probs = torch.nn.functional.softmax(logits, dim=-1)
+    sum_of_squares = (probs ** 2).sum(dim=-1)
+    return sum_of_squares
+
+
+def sum_of_squares_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 2048):
+    """Memory-efficient sum of squared probabilities calculation with chunking.
+    
+    Args:
+        logits: Tensor of shape (batch, vocab_size)
+        chunk_size: Number of samples to process at once
+        
+    Returns:
+        Tensor of shape (batch,) containing sum of squared probabilities
+    """
+    sum_of_squares = torch.zeros(logits.shape[0], device=logits.device)
+    for i in range(0, logits.shape[0], chunk_size):
+        logits_chunk = logits[i : i + chunk_size].float()
+        probs_chunk = torch.nn.functional.softmax(logits_chunk, dim=-1)
+        sum_of_squares_chunk = (probs_chunk ** 2).sum(dim=-1)
+        sum_of_squares[i : i + chunk_size] = sum_of_squares_chunk
+    return sum_of_squares
+
+
 def masked_sum(values, mask, axis=None):
     """Compute mean of tensor with a masked values."""
     # If NaNs exist out of mask, replace NaNs in values with a value that
