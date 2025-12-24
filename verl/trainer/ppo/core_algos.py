@@ -120,6 +120,47 @@ def get_probability_based_mask(
     return mask.long()  
 
 
+def get_entropy_probability_mask(
+    entropy,
+    log_prob,
+    sum_of_squares,
+    response_mask,
+    top_ratio=0.1,
+):
+    """
+    Select tokens based on combined entropy and probability criteria:
+    - Token is in top `top_ratio` high-entropy tokens AND
+    - Selected token probability > sum of squares of distribution
+    
+    This mode combines entropy-based selection with probability filtering,
+    using a lower default ratio (10% vs 20%) to focus on the most uncertain
+    tokens that also satisfy the probability criterion.
+    
+    Args:
+        entropy: [B, S] tensor of token entropies.
+        log_prob: [B, S] tensor of log probabilities of selected tokens.
+        sum_of_squares: [B, S] tensor of sum of squared probabilities.
+        response_mask: [B, S] tensor (1 = response token, 0 = non-response).
+        top_ratio: float, fraction of response tokens to consider (default 0.1 = 10%).
+        
+    Returns:
+        combined_mask: [B, S] binary mask (1 = selected token)
+    """
+    # First, get entropy top mask with lower ratio (10% instead of 20%)
+    entropy_mask = get_global_entropy_top_mask(entropy, response_mask, top_ratio=top_ratio)
+    
+    # Compute selected token probability from log_prob
+    selected_token_probs = torch.exp(log_prob)
+    
+    # Apply probability criterion: selected_token_probs > sum_of_squares
+    prob_condition = (selected_token_probs > sum_of_squares) & response_mask.bool()
+    
+    # Combine both masks with AND operation
+    combined_mask = entropy_mask.bool() & prob_condition
+    
+    return combined_mask.long()
+
+
 def register_policy_loss(name: str) -> Callable[[PolicyLossFn], PolicyLossFn]:
     """Register a policy loss function with the given name.
 

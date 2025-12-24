@@ -3,19 +3,10 @@
 # Adapted from recipe/dapo/run_dapo_qwen2.5_32b.sh, keeping almost all the hyperparameters of recipe/dapo/run_dapo_qwen2.5_32b.sh
 
 set -xeuo pipefail
-export WANDB_API_KEY=b83780f6c5922000838652bb1aba38ff4e926886
-
-# NCCL settings for multi-GPU stability
-export NCCL_DEBUG=WARN
-export NCCL_IB_DISABLE=0
-export NCCL_IB_GID_INDEX=3
-export NCCL_SOCKET_IFNAME=^lo,docker
-export NCCL_P2P_DISABLE=0
-export NCCL_ASYNC_ERROR_HANDLING=1
+export WANDB_API_KEY=XXXXXXXX
 
 # CUDA settings
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 source /opt/conda/etc/profile.d/conda.sh
 conda activate verl
@@ -31,13 +22,14 @@ ray start --head --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=8265
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}" && pwd)"
 
-# TOGGLE: Set to "full", "entropy", or "probability" to choose training mode
+# TOGGLE: Set to "full", "entropy", "probability", or "entropy-probability" to choose training mode
 # "full" = train on all tokens (standard DAPO)
 # "entropy" = train on only top 20% high-entropy tokens
 # "probability" = train on tokens selected by probability distribution criteria
-TRAINING_MODE=${TRAINING_MODE:-"probability"}  # default to entropy mode
+# "entropy-probability" = train on tokens selected by both entropy (top 10%) AND probability criteria
+TRAINING_MODE=${TRAINING_MODE:-"probability"}  # default to entropy-probability mode
 
-project_name='TOKEN_SELECTION'
+project_name='verl_select_token'
 if [ "$TRAINING_MODE" = "full" ]; then
     exp_name='RLVR-with-full-tokens-Qwen2.5-3B-long-data'
     use_entropy_filter=false
@@ -49,10 +41,15 @@ elif [ "$TRAINING_MODE" = "entropy" ]; then
     mask_mode='entropy'
     entropy_top_ratio=0.2
 elif [ "$TRAINING_MODE" = "probability" ]; then
-    exp_name='RLVR-with-probability-based-mask-Qwen2.5-3B-long-data'
+    exp_name='RLVR-with-probability-based-mask-Qwen2.5-3B-long-data-NoOverLongBuffer'
     use_entropy_filter=true
     mask_mode='probability'
     max_prob_threshold=0.5
+elif [ "$TRAINING_MODE" = "entropy-probability" ]; then
+    exp_name='RLVR-with-entropy01-probability-mask-Qwen2.5-3B-long-data'
+    use_entropy_filter=true
+    mask_mode='entropy-probability'
+    entropy_top_ratio=0.1  # lower ratio (10% vs 20%) for combined mode
 else
     echo "Invalid training mode: $TRAINING_MODE"
     exit 1
@@ -70,8 +67,8 @@ clip_ratio_high=0.28
 
 max_prompt_length=$((1024 * 2))
 max_response_length=$((1024 * 6))
-enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 2))
+enable_overlong_buffer=False
+overlong_buffer_len=$((1024 * 5))
 overlong_penalty_factor=1.0
 
 loss_agg_mode="token-mean"
@@ -117,9 +114,7 @@ infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
 offload=False
 gen_tp=1
 
-ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
-    --working-dir "${WORKING_DIR}" \
-    -- python3 -m recipe.dapo.main_dapo \
+python3 -m recipe.dapo.main_dapo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${VAL_FILES}" \
     data.prompt_key=prompt \
@@ -159,7 +154,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.65 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.55 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
@@ -194,4 +189,6 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
         echo "actor_rollout_ref.actor.mask_mode=entropy actor_rollout_ref.actor.entropy_top_ratio=${entropy_top_ratio}"; 
     elif [ "$TRAINING_MODE" = "probability" ]; then 
         echo "actor_rollout_ref.actor.mask_mode=probability actor_rollout_ref.actor.max_prob_threshold=${max_prob_threshold}"; 
+    elif [ "$TRAINING_MODE" = "entropy-probability" ]; then 
+        echo "actor_rollout_ref.actor.mask_mode=entropy-probability actor_rollout_ref.actor.entropy_top_ratio=${entropy_top_ratio}"; 
     fi)

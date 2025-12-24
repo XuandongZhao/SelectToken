@@ -31,6 +31,7 @@ from verl.trainer.ppo.core_algos import (
     agg_loss,
     get_global_entropy_top_mask,
     get_probability_based_mask,
+    get_entropy_probability_mask,
     get_policy_loss_fn,
     kl_penalty,
 )
@@ -115,6 +116,19 @@ class DataParallelPPOActor(BasePPOActor):
             torch.compile(sum_of_squares_from_logits, dynamic=True)
             if self.config.get("use_torch_compile", True)
             else sum_of_squares_from_logits
+        )
+        
+        # Set up self-certainty score computation (following entropy pattern)
+        certainty_with_chunking = self.config.get("self_certainty_with_chunking", False)
+        if certainty_with_chunking:
+            self_certainty_score_fn = verl_F.self_certainty_score_with_chunking
+        else:
+            self_certainty_score_fn = verl_F.self_certainty_score
+        
+        self.compute_self_certainty_score = (
+            torch.compile(self_certainty_score_fn, dynamic=True)
+            if self.config.get("use_torch_compile", True)
+            else self_certainty_score_fn
         )
         
         self.device_name = get_device_name()
@@ -226,9 +240,17 @@ class DataParallelPPOActor(BasePPOActor):
                     # Compute probability metrics if requested
                     max_probs_rmpad = None
                     sum_of_squares_rmpad = None
+                    self_certainty_rmpad = None
                     if compute_prob_metrics:
+                        # DEBUG: Check logit statistics
+                        if torch.distributed.get_rank() == 0:
+                            sample_logits = logits_rmpad[0]  # First token
+                            print(f"[DEBUG] Logits stats - max: {sample_logits.max().item():.2f}, min: {sample_logits.min().item():.2f}, mean: {sample_logits.mean().item():.2f}, std: {sample_logits.std().item():.2f}")
+                        
                         max_probs_rmpad = self.compute_max_probs_from_logits(logits_rmpad)
                         sum_of_squares_rmpad = self.compute_sum_of_squares_from_logits(logits_rmpad)
+                        # Self-certainty score: logsumexp(logits) - mean(logits)
+                        self_certainty_rmpad = self.compute_self_certainty_score(logits_rmpad)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
@@ -295,9 +317,16 @@ class DataParallelPPOActor(BasePPOActor):
                         batch=batch_size,
                         seqlen=seqlen,
                     )
+                    full_self_certainty = pad_input(
+                        hidden_states=self_certainty_rmpad.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
                     prob_metrics = {
                         'max_probs': full_max_probs.squeeze(-1)[:, -response_length - 1 : -1],
                         'sum_of_squares': full_sum_of_squares.squeeze(-1)[:, -response_length - 1 : -1],
+                        'self_certainty': full_self_certainty.squeeze(-1)[:, -response_length - 1 : -1],
                     }
 
                 # only return response part:
@@ -335,9 +364,11 @@ class DataParallelPPOActor(BasePPOActor):
                     if compute_prob_metrics:
                         max_probs = self.compute_max_probs_from_logits(logits)
                         sum_of_squares = self.compute_sum_of_squares_from_logits(logits)
+                        self_certainty = self.compute_self_certainty_score(logits)
                         prob_metrics = {
                             'max_probs': max_probs,
                             'sum_of_squares': sum_of_squares,
+                            'self_certainty': self_certainty,
                         }
                     
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
@@ -503,13 +534,15 @@ class DataParallelPPOActor(BasePPOActor):
                         raise ValueError(f"Invalid {entropy_top_ratio=}")
                     
                     # Check mask mode
-                    mask_mode = self.config.get('mask_mode', 'entropy')  # 'entropy' or 'probability'
+                    mask_mode = self.config.get('mask_mode', 'entropy')  # 'entropy', 'probability', or 'entropy-probability'
                     max_prob_threshold = self.config.get('max_prob_threshold', 0.5)
                     
                     if entropy_coeff != 0 or entropy_top_ratio is not None:
                         calculate_entropy = True
                     
-                    compute_prob_metrics = (mask_mode == 'probability')
+                    # Compute prob metrics when using probability mask, entropy-probability mask, or when configured
+                    # This also computes self-certainty score for logging
+                    compute_prob_metrics = (mask_mode in ['probability', 'entropy-probability']) or self.config.get('compute_self_certainty', True)
                     
                     entropy, log_prob, prob_metrics = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
@@ -535,6 +568,14 @@ class DataParallelPPOActor(BasePPOActor):
                             sum_of_squares=prob_metrics['sum_of_squares'],
                             response_mask=response_mask,
                             max_prob_threshold=max_prob_threshold,
+                        )
+                    elif mask_mode == 'entropy-probability' and entropy_top_ratio is not None and prob_metrics is not None:
+                        entropy_top_mask = get_entropy_probability_mask(
+                            entropy=entropy,
+                            log_prob=log_prob,
+                            sum_of_squares=prob_metrics['sum_of_squares'],
+                            response_mask=response_mask,
+                            top_ratio=entropy_top_ratio,
                         )
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
@@ -600,6 +641,27 @@ class DataParallelPPOActor(BasePPOActor):
                             "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                         }
                     )
+                    
+                    # Log mask ratio if mask is used
+                    if entropy_top_mask is not None:
+                        if mask_mode == 'entropy':
+                            mask_name = "entropy_top_mask"
+                        elif mask_mode == 'probability':
+                            mask_name = "probability_mask"
+                        else:  # 'entropy-probability'
+                            mask_name = "entropy_probability_mask"
+                        mask_ratio_value = verl_F.mask_ratio(entropy_top_mask, response_mask)
+                        micro_batch_metrics[f"actor/{mask_name}_ratio"] = mask_ratio_value
+                    
+                    # Log self-certainty score if prob_metrics are available
+                    if prob_metrics is not None and 'self_certainty' in prob_metrics:
+                        self_certainty = prob_metrics['self_certainty']
+                        # Compute aggregated self-certainty score using seq-mean-token-mean:
+                        # First mean over valid tokens within each response, then average over responses
+                        self_certainty_agg = agg_loss(loss_mat=self_certainty, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean")
+                        # Don't scale by loss_scale_factor - self-certainty is a metric, not a loss
+                        micro_batch_metrics["actor/self_certainty_score"] = self_certainty_agg.detach().item()
+                    
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()

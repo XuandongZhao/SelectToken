@@ -53,3 +53,9 @@ max_prob_threshold: 0.5
 
 # Use chunking for probability metrics calculation to reduce memory
 prob_metrics_from_logits_with_chunking: False
+
+# Use chunking for self-certainty score calculation to reduce memory
+self_certainty_with_chunking: False
+
+# Whether to always compute self-certainty score for logging (default: true)
+compute_self_certainty: True
