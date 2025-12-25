@@ -123,6 +123,11 @@ class ActorConfig(BaseConfig):
 
     # Added for "Beyond the 80/20 Rule" paper
     entropy_top_ratio: Optional[float] = None # fraction of response tokens to keep (e.g. 0.2 = top 20%)
+    
+    # Token selection mask configuration
+    mask_mode: str = 'entropy'  # 'entropy' or 'probability'
+    max_prob_threshold: float = 0.5  # threshold for max probability in probability mode
+    prob_metrics_from_logits_with_chunking: bool = False  # use chunking for memory efficiency
 
     def __post_init__(self):
         """Validate actor configuration parameters."""
@@ -222,6 +227,9 @@ class FSDPActorConfig(ActorConfig):
         entropy_from_logits_with_chunking (bool): Whether to compute entropy from logits
             with chunking for memory efficiency.
         entropy_checkpointing (bool): Whether to use gradient checkpointing for entropy computation.
+        self_certainty_with_chunking (bool): Whether to compute self-certainty with chunking
+            for memory efficiency.
+        compute_self_certainty (bool): Whether to compute self-certainty metric.
         fsdp_config (dict[str, Any]): Configuration for FSDP settings.
         use_remove_padding (bool): Whether to remove padding tokens in inputs during training
     """
@@ -231,6 +239,8 @@ class FSDPActorConfig(ActorConfig):
     ulysses_sequence_parallel_size: int = 1
     entropy_from_logits_with_chunking: bool = False
     entropy_checkpointing: bool = False
+    self_certainty_with_chunking: bool = False
+    compute_self_certainty: bool = True
     fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
     use_remove_padding: bool = False
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)

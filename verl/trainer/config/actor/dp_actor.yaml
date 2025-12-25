@@ -40,3 +40,22 @@ entropy_checkpointing: False
 
 # Whether to remove padding tokens in inputs during training
 use_remove_padding: ${oc.select:actor_rollout_ref.model.use_remove_padding,false}
+
+# Fraction of response tokens to keep based on entropy (e.g. 0.2 = top 20%)
+# Set to null to disable entropy-based token selection
+entropy_top_ratio: null
+
+# Token selection mask mode: 'entropy' or 'probability'
+mask_mode: entropy
+
+# Threshold for max probability in probability-based mask mode
+max_prob_threshold: 0.5
+
+# Use chunking for probability metrics calculation to reduce memory
+prob_metrics_from_logits_with_chunking: False
+
+# Use chunking for self-certainty score calculation to reduce memory
+self_certainty_with_chunking: False
+
+# Whether to always compute self-certainty score for logging (default: true)
+compute_self_certainty: True

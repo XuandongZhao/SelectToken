@@ -41,6 +41,21 @@ clip_ratio_high: 0.2
 # Added for "Beyond the 80/20 Rule" paper
 entropy_top_ratio: null # fraction of response tokens to keep (e.g. 0.2 = top 20%)
 
+# Token selection mask mode: 'entropy' or 'probability'
+mask_mode: entropy
+
+# Maximum probability threshold for probability-based mask
+max_prob_threshold: 0.5
+
+# Whether to use chunking for probability metrics computation
+prob_metrics_from_logits_with_chunking: false
+
+# Whether to use chunking for self-certainty score computation
+self_certainty_with_chunking: false
+
+# Whether to always compute self-certainty score for logging (default: true)
+compute_self_certainty: true
+
 # Whether to freeze vision model, if set true, it will be freeze vision model
 freeze_vision_tower: false
 
