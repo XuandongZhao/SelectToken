@@ -109,6 +109,9 @@ class RayDAPOTrainer(RayPPOTrainer):
         batch = None
         num_prompt_in_batch = 0
         num_gen_batches = 0
+        # Accumulate true accuracy metrics across generation batches
+        true_acc_scores_accumulator = []
+        true_acc_prompt_uid2scores_accumulator = defaultdict(list)
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
@@ -207,6 +210,21 @@ class RayDAPOTrainer(RayPPOTrainer):
                         else:
                             new_batch.batch["token_level_rewards"] = new_batch.batch["token_level_scores"]
 
+                    # Accumulate true accuracy metrics before filtering (using raw accuracy, not penalized rewards)
+                    if self.config.algorithm.filter_groups.enable and "acc" in new_batch.non_tensor_batch:
+                        try:
+                            # Use the raw accuracy scores from reward_extra_info, not token_level_scores which may include penalties
+                            raw_accs = new_batch.non_tensor_batch["acc"]
+                            
+                            # Collect scores by prompt uid - accumulate across generation batches
+                            for uid, acc in zip(new_batch.non_tensor_batch["uid"], raw_accs, strict=False):
+                                # Convert to float to ensure consistent dtype
+                                acc_val = float(acc) if not isinstance(acc, float) else acc
+                                true_acc_prompt_uid2scores_accumulator[uid].append(acc_val)
+                                true_acc_scores_accumulator.append(acc_val)
+                        except Exception as e:
+                            print(f"[WARNING] Failed to accumulate true accuracy metrics: {e}")
+
                     if not self.config.algorithm.filter_groups.enable:
                         batch = new_batch
                     else:  # NOTE: When prompts after filtering is less than train batch size,
@@ -269,6 +287,35 @@ class RayDAPOTrainer(RayPPOTrainer):
                             batch = batch[:traj_bsz]
 
                     # === Updating ===
+                    
+                    # Compute final true accuracy metrics after all generation batches are accumulated
+                    if self.config.algorithm.filter_groups.enable and len(true_acc_scores_accumulator) > 0:
+                        try:
+                            all_correct_count = 0
+                            all_incorrect_count = 0
+                            total_prompts = len(true_acc_prompt_uid2scores_accumulator)
+                            
+                            for uid, scores in true_acc_prompt_uid2scores_accumulator.items():
+                                if all(abs(s - 1.0) < 1e-6 for s in scores):
+                                    all_correct_count += 1
+                                elif all(abs(s - 0.0) < 1e-6 for s in scores):
+                                    all_incorrect_count += 1
+                            
+                            metrics.update({
+                                "true_accuracy/score_mean": float(np.mean(true_acc_scores_accumulator)),
+                                "true_accuracy/score_std": float(np.std(true_acc_scores_accumulator)),
+                                "true_accuracy/all_correct_ratio": float(all_correct_count / total_prompts) if total_prompts > 0 else 0.0,
+                                "true_accuracy/all_incorrect_ratio": float(all_incorrect_count / total_prompts) if total_prompts > 0 else 0.0,
+                                "true_accuracy/all_correct_count": int(all_correct_count),
+                                "true_accuracy/all_incorrect_count": int(all_incorrect_count),
+                                "true_accuracy/total_prompts": int(total_prompts),
+                            })
+                        except Exception as e:
+                            print(f"[WARNING] Failed to compute true accuracy metrics: {e}")
+                        finally:
+                            # Clear accumulators for next training step
+                            true_acc_scores_accumulator.clear()
+                            true_acc_prompt_uid2scores_accumulator.clear()
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
 
@@ -315,6 +362,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                     with marked_timer("adv", timing_raw, "brown"):
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
+                        use_sce_as_reward = self.config.algorithm.get("use_sce_as_reward", False)
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -322,6 +370,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            use_sce_as_reward=use_sce_as_reward,
                         )
 
                     # update critic

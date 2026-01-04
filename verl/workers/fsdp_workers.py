@@ -955,9 +955,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                output, entropys, self_certainty = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+            tensors = {"old_log_probs": output, "entropys": entropys}
+            if self_certainty is not None:
+                tensors["self_certainty"] = self_certainty
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
+                tensors=tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
             )
 

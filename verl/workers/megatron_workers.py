@@ -741,9 +741,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
-        output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+        output, entropys, self_certainty = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+        tensors = {"old_log_probs": output, "entropys": entropys}
+        if self_certainty is not None:
+            tensors["self_certainty"] = self_certainty
         output = DataProto.from_dict(
-            tensors={"old_log_probs": output, "entropys": entropys},
+            tensors=tensors,
             meta_info={"temperature": self.config.rollout.temperature},
         )
         output = output.to("cpu")

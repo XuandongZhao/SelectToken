@@ -440,28 +440,39 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        self_certainty_lst = []
+        compute_self_certainty = self.config.get('compute_self_certainty', False)
+        
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs, _ = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                entropy, log_probs, prob_metrics = self._forward_micro_batch(
+                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy,
+                    compute_prob_metrics=compute_self_certainty
                 )
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
+            if compute_self_certainty and prob_metrics is not None:
+                self_certainty_lst.append(prob_metrics['self_certainty'])
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
+        self_certainty = None
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
+        if compute_self_certainty and len(self_certainty_lst) > 0:
+            self_certainty = torch.concat(self_certainty_lst, dim=0)
 
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
+            if compute_self_certainty and self_certainty is not None:
+                self_certainty = restore_dynamic_batch(self_certainty, batch_idx_list)
 
-        return log_probs, entropys
+        return log_probs, entropys, self_certainty
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):

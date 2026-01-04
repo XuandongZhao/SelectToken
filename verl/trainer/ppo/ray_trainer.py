@@ -186,6 +186,7 @@ def compute_advantage(
     lam: float = 1.0,
     num_repeat: int = 1,
     norm_adv_by_std_in_grpo: bool = True,
+    use_sce_as_reward: bool = False,
     config: Optional[AlgoConfig] = None,
 ) -> DataProto:
     """Compute advantage estimates for policy optimization.
@@ -230,10 +231,29 @@ def compute_advantage(
     elif adv_estimator == AdvantageEstimator.GRPO:
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
+        
+        # Use self-certainty as reward if enabled, otherwise use token_level_rewards
+        if use_sce_as_reward and "self_certainty" in data.batch:
+            # Compute sentence-wise average self-certainty
+            self_certainty = data.batch["self_certainty"]
+            response_mask = data.batch["response_mask"]
+            # Average self-certainty over tokens in each response
+            sentence_sce = (self_certainty * response_mask).sum(dim=-1) / response_mask.sum(dim=-1).clamp(min=1)
+            
+            # Create token_level_rewards with reward ONLY on the last valid token (matching standard reward structure)
+            # This is important because GRPO sums token_level_rewards to get the total reward per sequence
+            token_level_rewards_for_grpo = torch.zeros_like(response_mask, dtype=sentence_sce.dtype)
+            # Find the last valid token position for each sequence
+            response_lengths = response_mask.sum(dim=-1).long()
+            batch_indices = torch.arange(response_mask.shape[0], device=response_mask.device)
+            # Place the sentence-wise reward on the last valid token
+            token_level_rewards_for_grpo[batch_indices, response_lengths - 1] = sentence_sce
+        else:
+            token_level_rewards_for_grpo = data.batch["token_level_rewards"]
 
         # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
+            token_level_rewards=token_level_rewards_for_grpo,
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
@@ -405,10 +425,13 @@ class RayPPOTrainer:
             f"{len(self.val_dataloader)}"
         )
 
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
-
+        # Compute total training steps from epochs or use explicit step count
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
+        elif self.config.trainer.total_epochs is not None:
+            total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+        else:
+            raise ValueError("Either total_training_steps or total_epochs must be specified")
 
         self.total_training_steps = total_training_steps
         print(f"Total training steps: {self.total_training_steps}")
