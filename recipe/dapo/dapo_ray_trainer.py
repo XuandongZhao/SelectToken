@@ -109,9 +109,6 @@ class RayDAPOTrainer(RayPPOTrainer):
         batch = None
         num_prompt_in_batch = 0
         num_gen_batches = 0
-        # Accumulate true accuracy metrics across generation batches
-        true_acc_scores_accumulator = []
-        true_acc_prompt_uid2scores_accumulator = defaultdict(list)
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 metrics = {}
@@ -210,20 +207,39 @@ class RayDAPOTrainer(RayPPOTrainer):
                         else:
                             new_batch.batch["token_level_rewards"] = new_batch.batch["token_level_scores"]
 
-                    # Accumulate true accuracy metrics before filtering (using raw accuracy, not penalized rewards)
+                    # Compute true accuracy metrics BEFORE filtering (only for this batch, not accumulated)
+                    # This is stateless per batch to avoid any memory/state issues
                     if self.config.algorithm.filter_groups.enable and "acc" in new_batch.non_tensor_batch:
                         try:
-                            # Use the raw accuracy scores from reward_extra_info, not token_level_scores which may include penalties
                             raw_accs = new_batch.non_tensor_batch["acc"]
+                            uids = new_batch.non_tensor_batch["uid"]
                             
-                            # Collect scores by prompt uid - accumulate across generation batches
-                            for uid, acc in zip(new_batch.non_tensor_batch["uid"], raw_accs, strict=False):
-                                # Convert to float to ensure consistent dtype
-                                acc_val = float(acc) if not isinstance(acc, float) else acc
-                                true_acc_prompt_uid2scores_accumulator[uid].append(acc_val)
-                                true_acc_scores_accumulator.append(acc_val)
+                            # Compute per-prompt stats for this batch only
+                            prompt_scores = {}  # uid -> list of scores
+                            for uid, acc in zip(uids, raw_accs):
+                                acc_val = float(acc)
+                                if uid not in prompt_scores:
+                                    prompt_scores[uid] = []
+                                prompt_scores[uid].append(acc_val)
+                            
+                            # Count stats
+                            all_scores = list(raw_accs)
+                            all_correct = sum(1 for scores in prompt_scores.values() if all(abs(s - 1.0) < 1e-6 for s in scores))
+                            all_incorrect = sum(1 for scores in prompt_scores.values() if all(abs(s - 0.0) < 1e-6 for s in scores))
+                            total_prompts = len(prompt_scores)
+                            
+                            # Update metrics (will be overwritten by final batch in multi-gen-batch case)
+                            metrics.update({
+                                "true_accuracy/score_mean": float(np.mean(all_scores)) if all_scores else 0.0,
+                                "true_accuracy/score_std": float(np.std(all_scores)) if all_scores else 0.0,
+                                "true_accuracy/all_correct_ratio": float(all_correct / total_prompts) if total_prompts > 0 else 0.0,
+                                "true_accuracy/all_incorrect_ratio": float(all_incorrect / total_prompts) if total_prompts > 0 else 0.0,
+                                "true_accuracy/all_correct_count": int(all_correct),
+                                "true_accuracy/all_incorrect_count": int(all_incorrect),
+                                "true_accuracy/total_prompts": int(total_prompts),
+                            })
                         except Exception as e:
-                            print(f"[WARNING] Failed to accumulate true accuracy metrics: {e}")
+                            print(f"[WARNING] Failed to compute true accuracy metrics: {e}")
 
                     if not self.config.algorithm.filter_groups.enable:
                         batch = new_batch
@@ -287,35 +303,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                             batch = batch[:traj_bsz]
 
                     # === Updating ===
-                    
-                    # Compute final true accuracy metrics after all generation batches are accumulated
-                    if self.config.algorithm.filter_groups.enable and len(true_acc_scores_accumulator) > 0:
-                        try:
-                            all_correct_count = 0
-                            all_incorrect_count = 0
-                            total_prompts = len(true_acc_prompt_uid2scores_accumulator)
-                            
-                            for uid, scores in true_acc_prompt_uid2scores_accumulator.items():
-                                if all(abs(s - 1.0) < 1e-6 for s in scores):
-                                    all_correct_count += 1
-                                elif all(abs(s - 0.0) < 1e-6 for s in scores):
-                                    all_incorrect_count += 1
-                            
-                            metrics.update({
-                                "true_accuracy/score_mean": float(np.mean(true_acc_scores_accumulator)),
-                                "true_accuracy/score_std": float(np.std(true_acc_scores_accumulator)),
-                                "true_accuracy/all_correct_ratio": float(all_correct_count / total_prompts) if total_prompts > 0 else 0.0,
-                                "true_accuracy/all_incorrect_ratio": float(all_incorrect_count / total_prompts) if total_prompts > 0 else 0.0,
-                                "true_accuracy/all_correct_count": int(all_correct_count),
-                                "true_accuracy/all_incorrect_count": int(all_incorrect_count),
-                                "true_accuracy/total_prompts": int(total_prompts),
-                            })
-                        except Exception as e:
-                            print(f"[WARNING] Failed to compute true accuracy metrics: {e}")
-                        finally:
-                            # Clear accumulators for next training step
-                            true_acc_scores_accumulator.clear()
-                            true_acc_prompt_uid2scores_accumulator.clear()
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
 
