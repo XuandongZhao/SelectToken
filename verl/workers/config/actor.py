@@ -120,6 +120,7 @@ class ActorConfig(BaseConfig):
     data_loader_seed = 1
     rollout_n: int = 1  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
+    vo_config: dict[str, Any] = field(default_factory=dict)
 
     # Added for "Beyond the 80/20 Rule" paper
     entropy_top_ratio: Optional[float] = None # fraction of response tokens to keep (e.g. 0.2 = top 20%)

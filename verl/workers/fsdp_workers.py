@@ -826,6 +826,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_config=self.config.actor.checkpoint,
             )
+            # Model-only checkpoint manager for delayed ref-buffer snapshots.
+            model_only_ckpt_cfg = OmegaConf.create({"save_contents": ["model"], "load_contents": ["model"]})
+            self.actor_model_only_checkpoint_manager = FSDPCheckpointManager(
+                model=self.actor_module_fsdp,
+                optimizer=None,
+                lr_scheduler=None,
+                processing_class=self.processor if self.processor is not None else self.tokenizer,
+                checkpoint_config=model_only_ckpt_cfg,
+            )
 
         if not self._is_actor and self._is_rollout:
             # If ActorRolloutRefWorker is initialized as a standalone rollout,
@@ -838,6 +847,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 lr_scheduler=None,
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_config=checkpoint_contents,
+            )
+
+        if self._is_ref:
+            # Model-only checkpoint manager to load buffered actor snapshots into ref model.
+            model_only_ckpt_cfg = OmegaConf.create({"save_contents": ["model"], "load_contents": ["model"]})
+            self.ref_model_only_checkpoint_manager = FSDPCheckpointManager(
+                model=self.ref_module_fsdp,
+                optimizer=None,
+                lr_scheduler=None,
+                processing_class=self.processor if self.processor is not None else self.tokenizer,
+                checkpoint_config=model_only_ckpt_cfg,
             )
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -998,7 +1018,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            output, _, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
             output = DataProto.from_dict(tensors={"ref_log_prob": output})
 
         output = output.to("cpu")
@@ -1012,6 +1032,254 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.ref_policy.actor_module.reshard()
 
         return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="blue", role="actor_compute_log_prob_ref_and_kl")
+    def compute_log_prob_ref_and_kl(self, data: DataProto):
+        """
+        Compute old_log_probs, ref_log_prob, and kl_per_token in one pass per micro-batch.
+        Used when vo_kl_mode is 'exact' or 'candidate_set' to avoid storing full seq*vocab logits.
+        Requires role actor_rollout_ref (same worker has both actor and ref_policy).
+        """
+        if not (self._is_actor and self._is_ref) or self._is_lora:
+            raise NotImplementedError(
+                "compute_log_prob_ref_and_kl requires actor_rollout_ref with standalone ref (not LoRA)."
+            )
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        from recipe.vo.vo_core_algos import exact_kl_from_logits, candidate_set_kl_from_logits
+
+        vo_kl_mode = str(data.meta_info.get("vo_kl_mode", "exact"))
+        if vo_kl_mode not in ("exact", "candidate_set"):
+            raise ValueError(
+                "VO worker does not support kl_mode=approximate; use exact or candidate_set."
+            )
+        candidate_kl_topk = int(data.meta_info.get("vo_candidate_kl_topk", 128))
+        candidate_kl_M = int(data.meta_info.get("vo_candidate_kl_M", 0))
+        exact_kl_vocab_chunk_size = int(data.meta_info.get("vo_exact_kl_vocab_chunk_size", 0))
+        temperature = data.meta_info.get("temperature", self.config.rollout.temperature)
+
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        non_tensor_keys = ["multi_modal_inputs"] if "multi_modal_inputs" in data.non_tensor_batch else []
+        data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_keys)
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        micro_batch_size = data.meta_info["micro_batch_size"]
+        # KL-specific smaller batch size (samples per forward) to reduce OOM in exact/candidate_set KL.
+        kl_micro_batch_size = getattr(
+            self.config.ref, "log_prob_kl_micro_batch_size_per_gpu", None
+        ) or getattr(
+            self.config.rollout, "log_prob_kl_micro_batch_size_per_gpu", None
+        ) or micro_batch_size
+        use_dynamic_bsz = bool(getattr(self.config.ref, "log_prob_use_dynamic_bsz", False))
+        max_token_len = int(getattr(self.config.ref, "log_prob_max_token_len_per_gpu", 0))
+        if use_dynamic_bsz and max_token_len > 0:
+            from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
+
+            max_token_len = max_token_len * self.ulysses_sequence_parallel_size
+            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+        else:
+            micro_batches = data.split(kl_micro_batch_size)
+            batch_idx_list = None
+
+        log_probs_lst = []
+        ref_log_probs_lst = []
+        kl_lst = []
+        entropy_lst = []
+        need_entropy = (
+            float(getattr(self.config.actor, "entropy_coeff", 0.0)) != 0.0
+            or getattr(self.config.actor, "entropy_top_ratio", None) is not None
+        )
+
+        def run_one_sub_batch(model_inputs):
+            out = self.actor.compute_log_prob_and_response_logits_for_micro_batch(
+                model_inputs, temperature, return_entropy=need_entropy, response_logits_format="packed"
+            )
+            pol_lp, pol_logits, ent_mb = out[0], out[1], out[2] if len(out) == 3 else None
+            ref_lp, ref_logits = self.ref_policy.compute_log_prob_and_response_logits_for_micro_batch(
+                model_inputs, temperature, response_logits_format="packed"
+            )
+            if pol_logits is None or ref_logits is None:
+                raise ValueError(
+                    "VO exact/candidate_set KL requires response logits from both actor and reference "
+                    "models. Detected missing logits (likely fused kernels path). "
+                    "Set actor_rollout_ref.model.use_fused_kernels=False for VO exact/candidate_set KL."
+                )
+            if isinstance(pol_logits, dict) and isinstance(ref_logits, dict):
+                if pol_logits.get("format") != "packed" or ref_logits.get("format") != "packed":
+                    raise ValueError("Unexpected response logits dict format for VO KL.")
+                pol_idx = pol_logits["index"]
+                ref_idx = ref_logits["index"]
+                if pol_idx.shape != ref_idx.shape or not torch.equal(pol_idx, ref_idx):
+                    raise ValueError("Actor/ref packed response index mismatch in VO KL path.")
+                valid = pol_idx >= 0
+                kl_mb = torch.zeros_like(pol_lp)
+                if valid.any():
+                    pol_logits_valid = pol_logits["logits"].unsqueeze(0)
+                    ref_logits_valid = ref_logits["logits"].unsqueeze(0)
+                    if vo_kl_mode == "exact":
+                        kl_valid = exact_kl_from_logits(
+                            pol_logits_valid,
+                            ref_logits_valid,
+                            temperature=temperature,
+                            vocab_chunk_size=exact_kl_vocab_chunk_size,
+                        ).squeeze(0)
+                    else:
+                        am = getattr(self.actor, "actor_module", None)
+                        vs = getattr(getattr(am, "config", None), "vocab_size", None) if am else None
+                        kl_valid = candidate_set_kl_from_logits(
+                            pol_logits_valid,
+                            ref_logits_valid,
+                            K=candidate_kl_topk,
+                            M=candidate_kl_M,
+                            vocab_size=vs,
+                            temperature=temperature,
+                        ).squeeze(0)
+                    kl_mb[valid] = kl_valid.to(dtype=kl_mb.dtype)
+            else:
+                if vo_kl_mode == "exact":
+                    kl_mb = exact_kl_from_logits(
+                        pol_logits,
+                        ref_logits,
+                        temperature=temperature,
+                        vocab_chunk_size=exact_kl_vocab_chunk_size,
+                    )
+                else:
+                    am = getattr(self.actor, "actor_module", None)
+                    vs = getattr(getattr(am, "config", None), "vocab_size", None) if am else None
+                    kl_mb = candidate_set_kl_from_logits(
+                        pol_logits, ref_logits, K=candidate_kl_topk, M=candidate_kl_M,
+                        vocab_size=vs, temperature=temperature
+                    )
+            return pol_lp, ref_lp, kl_mb, ent_mb
+
+        with self.ulysses_sharding_manager:
+            for micro_batch in micro_batches:
+                micro_batch = micro_batch.to(get_device_id())
+                batch_dict = micro_batch.batch
+                non_tensor_dict = micro_batch.non_tensor_batch
+                model_inputs = {**batch_dict, **non_tensor_dict}
+                pol_lp, ref_lp, kl_mb, ent_mb = run_one_sub_batch(model_inputs)
+                log_probs_lst.append(pol_lp.cpu())
+                ref_log_probs_lst.append(ref_lp.cpu())
+                kl_lst.append(kl_mb.cpu())
+                if ent_mb is not None:
+                    entropy_lst.append(ent_mb.cpu())
+
+        old_log_probs = torch.cat(log_probs_lst, dim=0)
+        ref_log_prob = torch.cat(ref_log_probs_lst, dim=0)
+        kl_per_token = torch.cat(kl_lst, dim=0)
+        entropys = torch.cat(entropy_lst, dim=0) if entropy_lst else None
+        if batch_idx_list is not None:
+            old_log_probs = restore_dynamic_batch(old_log_probs, batch_idx_list)
+            ref_log_prob = restore_dynamic_batch(ref_log_prob, batch_idx_list)
+            kl_per_token = restore_dynamic_batch(kl_per_token, batch_idx_list)
+            if entropys is not None:
+                entropys = restore_dynamic_batch(entropys, batch_idx_list)
+
+        tensors = {
+            "old_log_probs": old_log_probs,
+            "ref_log_prob": ref_log_prob,
+            "kl_per_token": kl_per_token,
+        }
+        if entropys is not None:
+            tensors["entropys"] = entropys
+        output = DataProto.from_dict(tensors=tensors, meta_info={"temperature": temperature})
+        output = output.to("cpu")
+
+        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+            self.actor.actor_module._handle.reshard(True)
+        if self.world_size > 1 and self.ref_policy.actor_module is not None:
+            if fsdp_version(self.ref_policy.actor_module) == 1:
+                self.ref_policy.actor_module._handle.reshard(True)
+            elif fsdp_version(self.ref_policy.actor_module) == 2:
+                self.ref_policy.actor_module.reshard()
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        return output
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def sync_ref_model(self, tau: float = 1.0):
+        """
+        Copy actor parameters to reference model (actor_rollout_ref only).
+        Called periodically during VO training to refresh the reference policy.
+        """
+        if not (self._is_actor and self._is_ref):
+            return
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            load_fsdp_model_to_gpu(self.ref_module_fsdp)
+        with torch.no_grad():
+            for param, ref_param in zip(
+                self.actor_module_fsdp.parameters(),
+                self.ref_module_fsdp.parameters(),
+            ):
+                if param is None or ref_param is None or param.shape != ref_param.shape:
+                    continue
+                if tau == 1.0:
+                    ref_param.data.copy_(param.data)
+                else:
+                    ref_param.data.mul_(1 - tau).add_(param.data * tau)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            offload_fsdp_model_to_cpu(self.ref_module_fsdp)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def refresh_adam_moments_keep_step(self):
+        """
+        Clear optimizer state (including Adam moments and step counters).
+        Useful when VO updates the reference model and wants a full optimizer-state reset.
+        """
+        if not self._is_actor or self.actor_optimizer is None:
+            return
+
+        cleared_params = len(self.actor_optimizer.state)
+        self.actor_optimizer.state.clear()
+        logger.info(
+            "Cleared optimizer state for %d parameter states (moments and step counters reset).",
+            cleared_params,
+        )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_actor_model_to_ref_buffer(self, local_path: str):
+        """
+        Save actor model shards to disk (model only) for delayed reference update.
+        """
+        if not self._is_actor:
+            return
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        self.actor_model_only_checkpoint_manager.save_checkpoint(
+            local_path=local_path,
+            hdfs_path=None,
+            global_step=0,
+            max_ckpt_to_keep=None,
+        )
+        dist.barrier()
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_ref_model_from_ref_buffer(self, local_path: str):
+        """
+        Load a previously saved actor snapshot into reference model (model only).
+        """
+        if not self._is_ref:
+            return
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.ref_module_fsdp)
+
+        self.ref_model_only_checkpoint_manager.load_checkpoint(
+            local_path=local_path,
+            hdfs_path=None,
+            del_local_after_load=False,
+        )
+        dist.barrier()
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.ref_module_fsdp)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):

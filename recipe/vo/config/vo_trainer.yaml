@@ -1,0 +1,79 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# VO/VPO Trainer Configuration
+# Inherits full PPO config from ppo_trainer, then applies VO-specific overrides
+# (same pattern as DAPO: hydra searchpath + defaults [ppo_trainer, _self_])
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# ======== VO-specific configuration (new section) ========
+vo:
+  gamma: 1.0
+  beta: 0.005
+  adaptive_beta: false  # When true: closed-form beta minimizing terminal-zero final-value loss
+  adaptive_beta_scope: per_prompt_batch  # per_prompt_batch or mini_batch
+  beta_upper_bound: 1.0  # Upper bound for effective beta when adaptive_beta is enabled
+  gae_lambda: 0.95
+  cliprange_value: 0.2
+  use_grpo_actor: false
+  use_ppo_actor: false
+  use_final_value_loss: false  # When true: SE(V_terminal, 0) only; GAE still computed for actor
+  unified_ppo_last_token: true  # When true: PPO actor uses unified epsilon-based advantage on final token too
+  grpo_coef: 0.5
+  cliprange_ppo: 0.2
+  update_ref_per_n_step: 20
+  ref_update_kl_threshold: null  # when set (e.g., 0.005), update ref if step mean KL >= threshold
+  update_ref_buffer_step: 0  # >0: save actor snapshot on ref-update trigger, then apply to ref after X steps
+  refresh_adam_upon_ref_update: false
+  # Supported modes: exact, candidate_set
+  kl_mode: exact
+  # For exact KL: optional vocab chunk size to lower transient memory (0 disables chunking)
+  exact_kl_vocab_chunk_size: 0
+  candidate_kl_topk: 128
+  candidate_kl_M: 0
+
+# ======== Data: gen_batch_size for rollout (override only) ========
+data:
+  gen_batch_size: ${data.train_batch_size}
+
+# ======== Reward model: DAPO manager + overlong_buffer ========
+# (enable only gates neural RM worker; reward_fn is always loaded like DAPO)
+reward_model:
+  reward_manager: dapo
+  overlong_buffer:
+    enable: false
+    len: 0
+    penalty_factor: 0.0
+    log: false
+
+# ======== Actor: use VO loss and pass vo config ========
+actor_rollout_ref:
+  actor:
+    policy_loss:
+      loss_mode: vo
+    vo_config: ${vo}
+
+# ======== Algorithm: GRPO-style adv + filter_groups ========
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: true
+  use_kl_in_reward: false
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.0
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+    enable: true
+    metric: seq_final_reward
+    max_num_gen_batches: 10
+
+# ======== Trainer: project/experiment names ========
+trainer:
+  project_name: VO-Training
+  experiment_name: vo-dapo
